@@ -1,4 +1,7 @@
-use base64::{read::DecoderReader as Base64Decoder, write::EncoderWriter as Base64Encoder};
+use base64::{
+    engine::general_purpose::GeneralPurpose as Base64Engine, read::DecoderReader as Base64Decoder,
+    write::EncoderWriter as Base64Encoder,
+};
 use flate2::{read::ZlibDecoder, write::ZlibEncoder, Compression};
 use objects::{Blueprint, BlueprintBook, DeconstructionPlanner, UpgradePlanner};
 use serde::{Deserialize, Serialize};
@@ -71,12 +74,14 @@ impl BlueprintCodec {
     pub fn encode_writer<W, F>(writer: W, inner: F) -> Result<()>
     where
         W: Write,
-        F: FnOnce(ZlibEncoder<&mut Base64Encoder<VersionPrefixWriter<W>>>) -> std::io::Result<()>,
+        F: FnOnce(
+            ZlibEncoder<&mut Base64Encoder<Base64Engine, VersionPrefixWriter<W>>>,
+        ) -> std::io::Result<()>,
     {
         // the final step before sending the data out is to prepend a 0.
-        let mut writer = VersionPrefixWriter::new('0', writer);
+        let writer = VersionPrefixWriter::new('0', writer);
         // before we prepend that 0, we need to base64-encode the stream
-        let mut writer = Base64Encoder::new(&mut writer, base64::STANDARD);
+        let mut writer = Base64Encoder::new(writer, &base64::engine::general_purpose::STANDARD);
         // note: we can't just hand this off, because we'll need to call its
         // `finish` method later
         {
@@ -85,7 +90,7 @@ impl BlueprintCodec {
             // hand it off to the inner closure
             inner(writer)?;
         }
-        writer.finish().map_err(|e| e.into())
+        writer.finish().map(|_| ()).map_err(|e| e.into())
     }
 
     /// write the blueprint string to the given writer
@@ -111,7 +116,7 @@ impl BlueprintCodec {
     where
         R: Read,
         F: FnOnce(
-            ZlibDecoder<Base64Decoder<VersionPrefixReader<WhitespaceRemover<R>>>>,
+            ZlibDecoder<&mut Base64Decoder<Base64Engine, VersionPrefixReader<WhitespaceRemover<R>>>>,
         ) -> std::io::Result<()>,
     {
         // first, get rid of all whitespace. We know that the blueprint is
@@ -119,17 +124,19 @@ impl BlueprintCodec {
         // just makes things a lot more robust.
         let reader = WhitespaceRemover::new(reader);
         // the first step is to take off the initial byte and check it
-        let mut reader = VersionPrefixReader::new('0', reader);
+        let reader = VersionPrefixReader::new('0', reader);
         // note: we can't just hand this off, because we'll need to call its
         // `had_expected_version` method later
-        {
+        let reader = {
             // decode base64
-            let reader = Base64Decoder::new(reader.by_ref(), base64::STANDARD);
+            let mut base64_reader =
+                Base64Decoder::new(reader, &base64::engine::general_purpose::STANDARD);
             // decompress it
-            let reader = ZlibDecoder::new(reader);
+            let reader = ZlibDecoder::new(&mut base64_reader);
             // hand it off to the inner closure
             inner(reader)?;
-        }
+            base64_reader.into_inner()
+        };
         if !reader.had_expected_version().ok_or(Error::NoData)? {
             Err(Error::UnknownVersion)?;
         }
